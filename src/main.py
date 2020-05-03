@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from mysql import connector
 
-import time, uuid
+import time, datetime, pytz, uuid
 
 INT_MAX = 2147483647
 
@@ -9,7 +9,28 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def wait_for_connection():
-	return jsonify({"status": "OK"}), 200
+	return jsonify({"status": "OK"})
+
+@app.route("/view", methods=["GET"])
+def view_trips():
+	# Se reseteaza conexiunea si obtine un cursor nou
+	db.cmd_reset_connection()
+	cursor = db.cursor()
+
+	src = request.args.get("src")
+	dst = request.args.get("dst")
+	departureDay = request.args.get("departure_day")
+
+	if departureDay == "%":
+		cursor.execute("select id, src, dst, hour, day, trip_time from trips where src like '{}' and dst like '{}' and cancelled = false".format(src, dst));
+	else:
+		cursor.execute("select id, src, dst, hour, day, trip_time from trips where src like '{}' and dst like '{}' and day = {} and cancelled = false".format(src, dst, int(departureDay)));
+
+	trips_info = cursor.fetchall()
+
+	cursor.close()
+
+	return jsonify({"status": trips_info})
 
 @app.route("/route", methods=["GET"])
 def get_optimal_route():
@@ -60,7 +81,7 @@ def get_optimal_route():
 
 	if len(optimal_route) == 0:
 		cursor.close()
-		return jsonify({"status": []}), 200
+		return jsonify({"status": []})
 
 	format_strings = ','.join(['{}'] * len(optimal_route))
 	cursor.execute("select id, src, dst, hour, day, trip_time from trips where id in ({})".format(format_strings).format(*optimal_route))
@@ -68,7 +89,7 @@ def get_optimal_route():
 
 	cursor.close()
 
-	return jsonify({"status" : trips_info}), 200
+	return jsonify({"status" : trips_info})
 
 def get_path(node, parents):
 	result = []
@@ -109,31 +130,35 @@ def book_ticket():
 		# Verificam daca trenul exista
 		if found_trip is None:
 			cursor.close()
-			return jsonify({"status" : "[ERROR] You can't book a ticket for this route because the trip " + id + " doesn't exist"}), 400
+			return jsonify({"status" : "[EROARE] Rezervarea nu s-a putut efectua deoarece trenul " + id + " nu exista!"})
 
 		(_, total_seats, booked, cancelled) = found_trip
 
 		# Verificam daca trenul a fost anulat
 		if cancelled:
 			cursor.close()
-			return jsonify({"status": "[ERROR] You can't book a ticket for this route because the trip " + id + " was cancelled"}), 400
+			return jsonify({"status": "[EROARE] Rezervarea nu s-a putut efectua deoarece trenul " + id + " a fost anulat!"})
 		# Verificam daca poate fi rezervat un loc (se tine cont de politica de overbooking)
 		if booked >= total_seats * 11 / 10:
 			cursor.close()
-			return jsonify({"status": "[ERROR] You can't book a ticket for this route because all seats of the trip " + id + " were booked"}), 400
+			return jsonify({"status": "[EROARE] Rezervarea nu s-a putut efectua deoarece toate locurile trenului " + id + " au fost rezervate!"})
 
 	bookingId = str(uuid.uuid4())
 
 	for id in ids:
 		cursor.execute("update trips set booked = booked + 1 where id = '{}'".format(id))
-		cursor.execute("insert into reservations values ('{}', '{}')".format(bookingId, id))
+		cursor.execute("insert into reservations values ('{}', '{}', '{}')".format(bookingId, id, datetime.datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%dT%H:%M:%S%z")))
 
 	cursor.execute("insert into bookingIds (bookingId) values ('{}')".format(bookingId))
 
 	cursor.close()
 	db.commit()
 
-	return jsonify({"status": "Route has been booked: " + bookingId}), 200
+	tren_this = "trenurile "
+	if len(ids) == 1:
+		tren_this = "trenul "
+
+	return jsonify({"status": "Rezervarea pentru " + tren_this + ', '.join(ids) + " a fost acceptata, avand identificatorul: " + bookingId})
 
 @app.route("/buy", methods=["GET"])
 def buy_ticket():
@@ -148,10 +173,10 @@ def buy_ticket():
 	availables = cursor.fetchall()
 	if len(availables) == 0:
 		cursor.close()
-		return jsonify({"status": "[ERROR] This bookingId doesn't exist\n"}), 400
+		return jsonify({"status": "[EROARE] Rezervarea cu numarul " + bookingId + " nu exista in baza de date!\n"})
 	if not availables[0][0]:
 		cursor.close()
-		return jsonify({"status": "[ERROR] You have previously bought tickets for this bookingId\n"}), 400
+		return jsonify({"status": "[EROARE] Rezervarea cu numarul " + bookingId + " a fost deja achitata!\n"})
 
 	cursor.execute("select tripId from reservations where bookingId = '{}'".format(bookingId))
 
@@ -168,26 +193,41 @@ def buy_ticket():
 		# Verificam daca trenul a fost intre timp anulat
 		if cancelled:
 			cursor.close()
-			return jsonify({"status": "[ERROR] You can't buy the tickets of this reservation because the trip " + id + " was cancelled"}), 400
+			return jsonify({"status": "[EROARE] Nu puteti achita rezervarea cu numarul " + bookingId + " deoarece trenul " + id + " a fost anulat!"})
 
 		boarding_pass[id] = (src, dst, hour, day, trip_time)
 		if bought >= total_seats:
 			cursor.close()
-			return jsonify({"status": "[ERROR] You can't buy the tickets of this reservation because all seats of the trip " + id + " were sold."}), 400
+			return jsonify({"status": "[EROARE] Nu puteti achita rezervarea cu numarul " + bookingId + " deoarece toate locurile trenului " + id + " au fost vandute!"})
 
-	message = "Boarding Pass:\n"
+	i = 0
+
+	ore = " ore.\n"
+	ora = " ora.\n"
+
+	message = "Bilete de calatorie:\n"
 
 	for id in sorted(ids, key = lambda id : boarding_pass[id][3] * 24 + boarding_pass[id][2]):
 		(src, dst, hour, day, trip_time) = boarding_pass[id]
 		cursor.execute("update trips set bought = bought + 1 where id = '{}'".format(id))
-		message = message + "Trip " + id + " from " + src + " to " + dst + " departs at hour " + str(hour) + ", day " + str(day) + " and will take " + str(trip_time) + " hours\n"
 
-	cursor.execute("update bookingIds set available = false where bookingId = '{}'".format(bookingId))
+		i += 1
+
+		ora_this = ore		
+		if trip_time == 1:
+			ora_this = ora
+
+		message = message + "> " + str(i) + ": Trenul " + id + ", de " + src + " la " + dst + ", pleaca la ora " + str(hour) + ", ziua " + str(day) + ", iar calatoria va dura " + str(trip_time) + ora_this
+
+	cursor.execute("update bookingIds set available = false, time = '{}' where bookingId = '{}'".format(datetime.datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%dT%H:%M:%S%z"), bookingId))
 
 	cursor.close()
 	db.commit()
 
-	return jsonify({"status": message}), 200
+	message += ">\n";
+	message += "> Va dorim o calatorie placuta!\n";
+
+	return jsonify({"status": message})
 
 if __name__ == "__main__":
 	# Conectarea la baza de date
